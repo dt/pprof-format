@@ -22,11 +22,15 @@ type DeepPartial<T> = {
   [P in keyof T]?: DeepPartial<T[P]>
 }
 
-function countNumberBytes(buffer: Uint8Array): number {
-  if (!buffer.length) return 0
-  let i = 0
+function countNumberBytes(buffer: Uint8Array, start = 0): number {
+  if (start >= buffer.length) return 0
+
+  // Fast path for single-byte numbers (most common case)
+  if (buffer[start] < 0b10000000) return 1
+
+  let i = start
   while (i < buffer.length && buffer[i++] >= 0b10000000);
-  return i
+  return i - start
 }
 
 function decodeBigNumber(buffer: Uint8Array): bigint {
@@ -39,23 +43,29 @@ function decodeBigNumber(buffer: Uint8Array): bigint {
   return value
 }
 
-function makeValue(value: Uint8Array, offset = 0) {
-  return { value, offset }
-}
 
-function getValue(mode: number, buffer: Uint8Array) {
+function getValue(mode: number, buffer: Uint8Array, startIndex: number) {
   switch (mode) {
     case kTypeVarInt:
-      for (let i = 0; i < buffer.length; i++) {
+      for (let i = startIndex; i < buffer.length; i++) {
         if (!(buffer[i] & 0b10000000)) {
-          return makeValue(buffer.slice(0, i + 1))
+          return {
+            value: buffer.subarray(startIndex, i + 1),
+            offset: 0
+          }
         }
       }
-      return makeValue(buffer)
+      return {
+        value: buffer.subarray(startIndex),
+        offset: 0
+      }
     case kTypeLengthDelim: {
-      const offset = countNumberBytes(buffer)
-      const size = decodeNumber(buffer)
-      return makeValue(buffer.slice(offset, Number(size) + offset), offset)
+      const offset = countNumberBytes(buffer, startIndex)
+      const size = decodeNumber(buffer, startIndex)
+      return {
+        value: buffer.subarray(startIndex + offset, startIndex + offset + Number(size)),
+        offset
+      }
     }
     default:
       throw new Error(`Unrecognized value type: ${mode}`)
@@ -99,31 +109,108 @@ function long(number: Numeric): Array<number> {
 const kTypeVarInt = 0
 const kTypeLengthDelim = 2
 
-function decodeNumber(buffer: Uint8Array): Numeric {
-  const size = countNumberBytes(buffer)
-  if (size > 4) return decodeBigNumber(buffer)
-  if (!buffer.length) return 0
+function decodeNumber(buffer: Uint8Array, start = 0): Numeric {
+  if (start >= buffer.length) return 0
 
-  let value = buffer[0] & 0b01111111
-  let i = 0
-  while (buffer[i++] >= 0b10000000) {
-    value |= (buffer[i] & 0b01111111) << (7 * i)
+  // Unrolled varint decoding for common small values
+  const x = buffer[start]
+  if (x < 0x80) return x
+
+  if (start + 1 >= buffer.length) return x & 0x7f
+  const y = buffer[start + 1]
+  if (y < 0x80) return (x & 0x7f) | (y << 7)
+
+  // Fallback to general case for 3+ bytes
+  const size = countNumberBytes(buffer, start)
+  if (size > 4) return decodeBigNumber(buffer.subarray(start))
+
+  let value = (x & 0x7f) | ((y & 0x7f) << 7)
+  let shift = 14
+  for (let i = start + 2; i < start + size; i++) {
+    value |= (buffer[i] & 0x7f) << shift
+    shift += 7
   }
   return value
 }
 
-function decodeNumbers(buffer: Uint8Array): Array<Numeric> {
-  const values = []
-  let start = 0
 
-  for (let i = 0; i < buffer.length; i++) {
-    if ((buffer[i] & 0b10000000) === 0) {
-      values.push(decodeNumber(buffer.slice(start, i + 1)))
-      start = i + 1
+// Number.MAX_SAFE_INTEGER as BigInt.
+const MAX_SAFE = 9007199254740991n; 
+
+function decodeNumbers(buffer: Uint8Array, start = 0, end = buffer.length): Array<Numeric> {
+  if (end === 0) return [];
+
+  // Pre-allocation guess, capped at 8MB, to reduce array growth overhead.
+  const out: Array<Numeric> = new Array(Math.min(end - start, 8388608)); 
+
+  let o = 0; // write index
+  let i = start; // read cursor
+  const buf = buffer; // local alias for JIT
+
+  const bulkEnd = end - 3;
+  while (i < end) {
+      const b0 = buf[i++];
+
+    if (i < bulkEnd) {
+      // Fast check: if all are single-byte varints.
+      const b1=buf[i], b2=buf[i+1], b3=buf[i+2]
+      if ((b0 | b1 | b2 | b3) < 0x80) {
+        out[o++] = b0; out[o++] = b1; out[o++] = b2; out[o++] = b3
+        i += 3
+        continue
+      }
+      // Also check for 2 consecutive 2-byte varints (cont,final,cont,final)
+      if (b0 >= 0x80 && b1 < 0x80 && b2 >= 0x80 && b3 < 0x80) {
+        out[o++] = (b0 & 0x7f) | (b1 << 7)
+        out[o++] = (b2 & 0x7f) | (b3 << 7)
+        i += 3
+        continue
+      }
+    }
+
+    // Unrolled single varint decoding, for 1, 2, 3 and 4 byte varints.
+    if (b0 < 0x80) { out[o++] = b0; continue; }
+
+    if (i >= end) { out[o++] = (b0 & 0x7f); break; }
+    const b1 = buf[i++];
+    let v = (b0 & 0x7f) | ((b1 & 0x7f) << 7);
+    if (b1 < 0x80) { out[o++] = v; continue; }
+
+    if (i >= end) { out[o++] = v; break; }
+    const b2 = buf[i++];
+    v |= (b2 & 0x7f) << 14;
+    if (b2 < 0x80) { out[o++] = v; continue; }
+
+    if (i >= end) { out[o++] = v; break; }
+    const b3 = buf[i++];
+    v |= (b3 & 0x7f) << 21;
+    if (b3 < 0x80) { out[o++] = v; continue; }
+
+    // 5+ bytes: assemble as BigInt with multiplication.
+    let big = BigInt(v);
+    let mul = 1n << 28n; // 128^4 = 2^(7*4) since we've consumed 4 continuation chunks
+
+    // We've consumed 4 bytes already; read up to protobuf's max of 10 total.
+    for (let bytesRead = 0; bytesRead < 6; bytesRead++) {
+      if (i >= end) { out[o++] = big; i = end; break; }
+      const bx = buf[i++];
+      big += BigInt(bx & 0x7f) * mul;
+      if (bx < 0x80) {
+        // Downcast when safe to match legacy behavior.
+        out[o++] = (big <= MAX_SAFE) ? Number(big) : big;
+        break;
+      }
+      mul *= 128n;
+      if (bytesRead === 5) {
+        // Malformed (continuation past 10th byte). Emit partial to advance.
+        out[o++] = (big <= MAX_SAFE) ? Number(big) : big;
+      }
     }
   }
 
-  return values
+  // Trim out to actual size.
+  out.length = o; 
+  return out;
 }
 
 function push<T>(value: T, list?: Array<T>): Array<T> {
@@ -310,7 +397,7 @@ function decode<T>(
     const mode = buffer[index] & 0b111
     index++
 
-    const { offset, value } = getValue(mode, buffer.slice(index))
+    const { offset, value } = getValue(mode, buffer, index)
     index += value.length + offset
 
     decoder(data, field, value)
@@ -523,22 +610,64 @@ export class Sample {
     return buffer
   }
 
-  static decodeValue(data: SampleInput, field: number, buffer: Uint8Array) {
-    switch (field) {
-      case 1:
-        data.locationId = decodeNumbers(buffer)
-        break
-      case 2:
-        data.value = decodeNumbers(buffer)
-        break
-      case 3:
-        data.label = push(Label.decode(buffer), data.label)
-        break
-    }
-  }
-
   static decode(buffer: Uint8Array): Sample {
-    return new this(decode(buffer, this.decodeValue) as SampleInput)
+    const out = {} as SampleInput;
+    let index = 0
+
+    // Inline `decode` and `getValue` to avoid re-slicing buf, and just pass
+    // offsets to decodeNumbers instead.
+    while (index < buffer.length) {
+      const field = buffer[index] >> 3
+      const mode = buffer[index] & 0b111
+      index++
+
+      if (mode === kTypeVarInt) {
+        let end = index;
+        while (end < buffer.length && buffer[end] >= 0x80) end++;
+        end++; // include final byte
+
+        switch (field) {
+        case 1:
+          out.locationId = decodeNumbers(buffer, index, end)
+          break
+        case 2:
+          out.value = decodeNumbers(buffer, index, end)
+          break
+        }
+        index = end
+      } else if (mode === kTypeLengthDelim) {
+        // Read length varint first
+        let len = 0
+        let shift = 0
+
+        while (index < buffer.length) {
+          const b = buffer[index++]
+          len |= (b & 0x7f) << shift
+          if (b < 0x80) break
+          shift += 7
+        }
+
+        const dataStart = index
+        const dataEnd = index + len
+
+        switch (field) {
+        case 1:
+          out.locationId = decodeNumbers(buffer, dataStart, dataEnd)
+          break
+        case 2:
+          out.value = decodeNumbers(buffer, dataStart, dataEnd)
+          break
+        case 3:
+          out.label = push(Label.decode(buffer.subarray(dataStart, dataEnd)), out.label)
+          break
+        }
+        index = dataEnd
+      } else {
+        throw new Error(`Unrecognized value type: ${mode}`)
+      }
+    }
+
+    return new this(out);
   }
 }
 
