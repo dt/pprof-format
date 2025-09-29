@@ -394,3 +394,40 @@ tap.test('Protobufjs compat', async (t: Test) => {
     t.same(profileToObject(Profile.decode(buf)), toObject(decode(buf), {longs: String, defaults: true}))
   })
 })
+
+tap.test('Benchmark', async (t: Test) => {
+  await t.test('Decode performance baseline', async (t: Test) => {
+    const filePath = './testing/test.pprof'
+
+    if (!fs.existsSync(filePath)) {
+      t.skip(`File not found: ${filePath}`)
+      return
+    }
+
+    // Read and decompress once
+    const buf = gunzipSync(fs.readFileSync(filePath))
+
+    // Warm up
+    Profile.decode(buf)
+
+    // Benchmark
+    const iterations = 3
+    const times: number[] = []
+
+    for (let i = 0; i < iterations; i++) {
+      const start = performance.now()
+      const profile = Profile.decode(buf)
+      const end = performance.now()
+      times.push(end - start)
+
+      // Sanity check
+      t.ok(profile.sample.length > 0, `Iteration ${i + 1}: Profile has samples`)
+    }
+
+    const avgTime = times.reduce((a, b) => a + b) / times.length
+    console.log(`\nBenchmark: Average decode time: ${avgTime.toFixed(2)}ms (${times.map(t => t.toFixed(1)).join(', ')}ms)`)
+    console.log(`Samples: ${Profile.decode(buf).sample.length}`)
+
+    t.ok(avgTime > 0, 'Decode time measured')
+  })
+})
